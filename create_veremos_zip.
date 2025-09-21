@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="./veremos-prototype"
+BACKEND="$ROOT/backend"
+FRONTEND="$ROOT/frontend"
+SRC="$FRONTEND/src"
+COMP="$SRC/components"
+
+echo "Creando estructura de carpetas..."
+rm -rf "$ROOT"
+mkdir -p "$COMP"
+
+echo "Escribiendo archivos backend..."
+
+cat > "$BACKEND/package.json" <<'JSON'
+{
+  "name": "veremos-backend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2",
+    "fs-extra": "^11.1.1"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  }
+}
+JSON
+
+cat > "$BACKEND/index.js" <<'NODE'
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const fs = require('fs-extra');
+const path = require('path');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
+app.use(cors());
+app.use(express.json());
+
+const DATA_FILE = path.join(__dirname, 'data.json');
+
+async function readData() {
+  try {
+    return await fs.readJson(DATA_FILE);
+  } catch (e) {
+    return { requests: [], messages: [] };
+  }
+}
+async function writeData(data) {
+  await fs.writeJson(DATA_FILE, data, { spaces: 2 });
+}
+
+// REST: obtener solicitudes
+app.get('/api/requests', async (req, res) => {
+  const data = await readData();
+  res.json(data.requests || []);
+});
+
+// REST: crear solicitud (puede venir del frontend)
+app.post('/api/requests', async (req, res) => {
+  const { type, note, from } = req.body;
+  const data = await readData();
+  const newReq = { id: 'req-' + Date.now(), type, note: note || '', from: from || 'unknown', time: new Date().toISOString(), status: 'new' };
+  data.requests.unshift(newReq);
+  await writeData(data);
+  // notificar via socket
+  io.emit('request:new', newReq);
+  res.status(201).json(newReq);
+});
+
+// REST: marcar como atendida
+app.post('/api/requests/:id/ack', async (req, res) => {
+  const id = req.params.id;
+  const data = await readData();
+  const idx = data.requests.findIndex(r => r.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'not found' });
+  data.requests[idx].status = 'handled';
+  await writeData(data);
+  io.emit('request:updated', data.requests[idx]);
+  res.json(data.requests[idx]);
+});
+
+// Socket.IO — chat y sincronización
+io.on('connection', (socket) => {
+  console.log('socket connected', socket.id);
+
+  // cliente pide historial
+  socket.on('messages:get', async () => {
+    const data = await readData();
+    socket.emit('messages:list', data.messages || []);
+  });
+
+  // nuevo mensaje
+  socket.on('message:new', async (msg) => {
+    const data = await readData();
+    const stored = { id: 'msg-' + Date.now(), ...msg, time: new Date().toISOString() };
+    data.messages = data.messages || [];
+    data.messages.push(stored);
+    await writeData(data);
+    // emitir a todos (en prototipo usamos broadcast global)
+    io.emit('message:received', stored);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('socket disconnected', socket.id);
+  });
+});
+
+const PORT = process.env.PORT || 4000;
+server.listen(PORT, () => console.log(`Veremos backend listening on ${PORT}`));
+NODE
+
+cat > "$BACKEND/data.json" <<'JSON'
+{
+  "requests": [],
+  "messages": []
+}
+JSON
+
+echo "Escribiendo archivos frontend..."
+
+cat > "$FRONTEND/package.json" <<'JSON'
+{
+  "name": "veremos-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "socket.io-client": "^4.7.2"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}
+JSON
+
+cat > "$FRONTEND/index.html" <<'HTML'
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+    <title>Veremos - Prototipo</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+HTML
+
+cat > "$SRC/main.jsx" <<'JSX'
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+import './styles.css';
+
+createRoot(document.getElementById('root')).render(<App />);
+JSX
+
+cat > "$SRC/App.jsx" <<'JSX'
+import React, { useEffect, useState } from 'react';
+import io from 'socket.io-client';
+import ChatWindow from './components/ChatWindow';
+import QuickRequests from './components/QuickRequests';
+import RequestPanel from './components/RequestPanel';
+
+const BACKEND = import.meta.env.VITE_BACKEND_URL || 'http://localhost:4000';
+const socket = io(BACKEND);
+
+const passengerId = 'pax-001';
+const auxId = 'aux-001';
+
+export default function App() {
+  const [role, setRole] = useState('passenger');
+  const [requests, setRequests] = useState([]);
+  const [messages, setMessages] = useState([]);
+
+  useEffect(() => {
+    // cargar solicitudes via REST
+    fetch(`${BACKEND}/api/requests`).then(r => r.json()).then(setRequests).catch(() => {});
+
+    // solicitar historial de mensajes
+    socket.emit('messages:get');
+    socket.on('messages:list', (list) => setMessages(list));
+
+    socket.on('message:received', (msg) => setMessages(prev => [...prev, msg]));
+    socket.on('request:new', (req) => setRequests(prev => [req, ...prev]));
+    socket.on('request:updated', (req) => setRequests(prev => prev.map(r => r.id === req.id ? req : r)));
+
+    return () => {
+      socket.off('messages:list');
+      socket.off('message:received');
+      socket.off('request:new');
+      socket.off('request:updated');
+    };
+  }, []);
+
+  const sendMessage = (from, to, text) => {
+    const payload = { from, to, text };
+    socket.emit('message:new', payload);
+  };
+
+  const sendQuickRequest = async (type, note) => {
+    const body = { type, note, from: passengerId };
+    await fetch(`${BACKEND}/api/requests`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    // backend emitirá la notificación
+  };
+
+  const acknowledge = async (id) => {
+    await fetch(`${BACKEND}/api/requests/${id}/ack`, { method: 'POST' });
+  };
+
+  return (
+    <div className="app-root">
+      <header className="app-header">
+        <h1>Veremos — Prototipo Full-Stack</h1>
+        <div>
+          <label>Ver como: </label>
+          <select value={role} onChange={e => setRole(e.target.value)}>
+            <option value="passenger">Pasajero</option>
+            <option value="aux">Auxiliar</option>
+          </select>
+        </div>
+      </header>
+
+      <main className="app-main">
+        {role === 'passenger' && (
+          <div className="col-left">
+            <QuickRequests onSend={sendQuickRequest} />
+          </div>
+        )}
+
+        <div className="col-right">
+          <ChatWindow me={role === 'passenger' ? passengerId : auxId} other={role === 'passenger' ? auxId : passengerId} messages={messages} onSend={(t) => sendMessage(role === 'passenger' ? passengerId : auxId, role === 'passenger' ? auxId : passengerId, t)} />
+        </div>
+
+        {role === 'aux' && (
+          <aside className="side-panel">
+            <RequestPanel requests={requests} onAck={acknowledge} />
+          </aside>
+        )}
+      </main>
+    </div>
+  );
+}
+JSX
+
+cat > "$COMP/ChatWindow.jsx" <<'JSX'
+import React, { useEffect, useRef, useState } from 'react';
+
+export default function ChatWindow({ me, other, messages, onSend }) {
+  const [text, setText] = useState('');
+  const boxRef = useRef(null);
+
+  useEffect(() => {
+    if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight;
+  }, [messages.length]);
+
+  const filtered = messages.filter(m => (m.from === me && m.to === other) || (m.from === other && m.to === me));
+
+  return (
+    <div className="chat-window">
+      <div ref={boxRef} className="chat-list">
+        {filtered.map(m => (
+          <div key={m.id} className={`chat-msg ${m.from === me ? 'me' : 'them'}`}>
+            <div className="msg-text">{m.text}</div>
+            <div className="msg-time">{new Date(m.time).toLocaleTimeString()}</div>
+          </div>
+        ))}
+      </div>
+      <div className="chat-form">
+        <input value={text} onChange={e => setText(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && text.trim()) { onSend(text.trim()); setText(''); } }} placeholder="Escribe un mensaje..." />
+        <button onClick={() => { if (text.trim()) { onSend(text.trim()); setText(''); } }}>Enviar</button>
+      </div>
+    </div>
+  );
+}
+JSX
+
+cat > "$COMP/QuickRequests.jsx" <<'JSX'
+import React, { useState } from 'react';
+
+export default function QuickRequests({ onSend }) {
+  const [note, setNote] = useState('');
+  const opts = ['Agua', 'Manta', 'Asistencia médica', 'Temperatura', 'Consulta de asiento'];
+  return (
+    <div>
+      <h3>Solicitudes rápidas</h3>
+      {opts.map(o => <button key={o} onClick={() => onSend(o)}>{o}</button>)}
+      <div>
+        <input value={note} onChange={e => setNote(e.target.value)} placeholder="Nota (opcional)" />
+        <button onClick={() => { if (note.trim()) { onSend('Solicitud personalizada', note.trim()); setNote(''); } }}>Enviar</button>
+      </div>
+    </div>
+  );
+}
+JSX
+
+cat > "$COMP/RequestPanel.jsx" <<'JSX'
+import React from 'react';
+
+export default function RequestPanel({ requests = [], onAck }) {
+  return (
+    <div>
+      <h3>Panel de solicitudes</h3>
+      {requests.length === 0 && <p>No hay solicitudes.</p>}
+      {requests.map(r => (
+        <div key={r.id} className="req-item">
+          <div><strong>{r.type}</strong></div>
+          {r.note && <div>{r.note}</div>}
+          <div>{new Date(r.time).toLocaleString()}</div>
+          <div>Status: {r.status}</div>
+          {r.status === 'new' && <button onClick={() => onAck(r.id)}>Marcar atendido</button>}
+        </div>
+      ))}
+    </div>
+  );
+}
+JSX
+
+cat > "$SRC/styles.css" <<'CSS'
+body { font-family: Inter, Arial, sans-serif; margin: 0; padding: 0; }
+.app-header { display:flex; justify-content:space-between; align-items:center; padding:16px; background:#0f172a; color:white; }
+.app-main { display:flex; gap:16px; padding:16px; }
+.col-left { width:250px; }
+.col-right { flex:1; }
+.side-panel { width:300px; }
+.chat-window { display:flex; flex-direction:column; height:70vh; border:1px solid #ddd; border-radius:8px; }
+.chat-list { flex:1; overflow:auto; padding:12px; }
+.chat-msg { margin-bottom:8px; max-width:70%; }
+.chat-msg.me { margin-left:auto; text-align:right; }
+.chat-msg .msg-text { background:#e6f2ff; display:inline-block; padding:8px 10px; border-radius:8px; }
+.chat-form { display:flex; gap:8px; padding:8px; }
+CSS
+
+cat > "$ROOT/README.md" <<'TXT'
+Veremos Prototype - Full Stack (Backend + Frontend)
+
+Estructura:
+- backend/: servidor Express + Socket.IO (puerto 4000)
+- frontend/: app React (Vite)
+
+Instrucciones:
+1) Backend:
+   cd backend
+   npm install
+   npm run dev
+
+2) Frontend:
+   cd frontend
+   npm install
+   npm run dev
+
+Backend corre en http://localhost:4000 y frontend en http://localhost:5173 (Vite).
+TXT
+
+echo "Creando ZIP..."
+ZIPNAME="veremos-prototype.zip"
+rm -f "$ZIPNAME"
+zip -r "$ZIPNAME" "$(basename "$ROOT")" >/dev/null
+
+echo "Listo: $ZIPNAME creado en $(pwd)"
+echo "Contenido:"
+unzip -l "$ZIPNAME" | sed -n '1,20p'
